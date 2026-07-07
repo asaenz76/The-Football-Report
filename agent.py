@@ -162,13 +162,10 @@ def get_standings(league_id: str) -> list:
 
 
 def _trim_event(event: dict) -> dict:
-    """Keep only the fields useful for editorial judgment. Drops the heavy nested
-    arrays (full match statistics, lineups, substitutions) that apifootball.com
-    includes on every event — on the free plan these are mostly empty anyway, and
-    including them was the single biggest driver of generation cost (every internal
-    tool-use round trip in the Claude call resends the full context)."""
+    """Keep only the fields useful for editorial judgment."""
     return {
         "match_id": event.get("match_id"),
+        "league_id": event.get("league_id"),
         "country_name": event.get("country_name"),
         "league_name": event.get("league_name"),
         "match_date": event.get("match_date"),
@@ -191,30 +188,109 @@ def _trim_event(event: dict) -> dict:
     }
 
 
-def _trim_standings_row(row: dict) -> dict:
-    """Standings rows are already fairly flat — drop only the badge/logo URLs, which
-    add bytes with no editorial value."""
-    return {k: v for k, v in row.items() if not k.endswith(("_logo", "_badge"))}
+# From system_prompt.md's own RESEARCH SCOPE section — competitions the editorial
+# standard considers worth covering. Matched as case-insensitive substrings against
+# apifootball's free-text league_name, since the API gives no tier/importance flag.
+PRIORITY_LEAGUE_KEYWORDS = [
+    "champions league", "europa league", "conference league",
+    "premier league", "la liga", "serie a", "bundesliga", "ligue 1",
+    "eredivisie", "primeira liga", "mls", "major league soccer",
+    "saudi pro league", "brasileir", "primera division", "primera división",
+    "copa libertadores", "copa sudamericana",
+    "world cup", "club world cup", "euro", "nations league",
+    "copa america", "copa américa", "gold cup", "afcon", "africa cup",
+    "asian cup",
+]
 
 
-def collect_football_data(date_str: str) -> dict:
+def _is_priority_match(event: dict) -> bool:
+    name = (event.get("league_name") or "").lower()
+    return any(keyword in name for keyword in PRIORITY_LEAGUE_KEYWORDS)
+
+
+def _select_priority_events(events: list, limit: int = 12) -> list:
+    """Narrow the day's full fixture list down to what's actually worth putting in
+    front of Claude. Sending all ~130 daily events (many from obscure lower
+    divisions) was the single biggest driver of generation cost — both directly and
+    because every internal search round in the Claude call resends the full context."""
+    priority = [e for e in events if _is_priority_match(e)]
+    priority.sort(key=lambda e: (e.get("league_name") or "", e.get("match_time") or ""))
+    return priority[:limit]
+
+
+def _team_standing_rows(team_names: set, standings_rows: list, max_rows: int = 2) -> list:
+    """Just the standings rows for the two teams in a specific match — not the full
+    table. Matches case-insensitively since team names can differ slightly in
+    capitalization between apifootball's events and standings feeds."""
+    lowered = {t.lower() for t in team_names if t}
+    matches = [r for r in standings_rows if (r.get("team_name") or "").lower() in lowered]
+    return matches[:max_rows]
+
+
+def _compact_standing(row: dict) -> dict:
+    return {
+        "team": row.get("team_name"),
+        "position": row.get("overall_league_position"),
+        "played": row.get("overall_league_payed"),
+        "points": row.get("overall_league_PTS"),
+    }
+
+
+def collect_football_data(date_str: str) -> list:
+    """Returns a compact list of the day's priority matches, each carrying just its
+    two teams' standings rows (not the full table)."""
     events = get_events(date_str)
-    league_ids = sorted({e["league_id"] for e in events if e.get("league_id")})
+    priority_events = _select_priority_events(events, limit=12)
+    league_ids = sorted({e["league_id"] for e in priority_events if e.get("league_id")})
 
-    # Fetch standings in parallel — sequentially, ~26 leagues each with their own
-    # retry budget against a flaky endpoint was what caused a 20+ minute stall.
-    # Bounded worst case now: (leagues / max_workers) * ~45s per call, not the sum.
-    standings: dict[str, list] = {}
+    standings_raw: dict[str, list] = {}
     if league_ids:
         with ThreadPoolExecutor(max_workers=6) as pool:
             future_to_league = {pool.submit(get_standings, lid): lid for lid in league_ids}
             for future in as_completed(future_to_league):
-                standings[future_to_league[future]] = future.result()
+                standings_raw[future_to_league[future]] = future.result()
 
-    return {
-        "events": [_trim_event(e) for e in events],
-        "standings": {lid: [_trim_standings_row(r) for r in rows] for lid, rows in standings.items()},
-    }
+    matches = []
+    for event in priority_events:
+        trimmed = _trim_event(event)
+        rows = standings_raw.get(trimmed["league_id"], [])
+        team_rows = _team_standing_rows({trimmed["home_team"], trimmed["away_team"]}, rows)
+        matches.append({**trimmed, "standings": [_compact_standing(r) for r in team_rows]})
+
+    return matches
+
+
+def _format_football_data_as_text(matches: list) -> str:
+    """Compact, human-readable summary — never raw JSON — one or two lines per
+    match. This is what actually goes in the prompt."""
+    if not matches:
+        return "No fixtures found in the priority competitions for this date."
+
+    lines = []
+    for m in matches:
+        score = (
+            f"{m['home_score']}-{m['away_score']}"
+            if m["home_score"] not in (None, "") else "vs"
+        )
+        line = (
+            f"- [{m['country_name']} / {m['league_name']}] "
+            f"{m['home_team']} {score} {m['away_team']} "
+            f"({m['match_status']}, {m['match_date']} {m['match_time']})"
+        )
+        if m["standings"]:
+            table_bits = ", ".join(
+                f"{s['team']} #{s['position']} ({s['points']} pts, {s['played']} played)"
+                for s in m["standings"]
+            )
+            line += f" | Table: {table_bits}"
+        if m["goalscorer"]:
+            scorers = "; ".join(f"{g['time']}' {g['score']} ({g['side']})" for g in m["goalscorer"][:5])
+            line += f" | Goals: {scorers}"
+        if m["cards"]:
+            cards = "; ".join(f"{c['time']}' {c['card']} ({c['side']})" for c in m["cards"][:5])
+            line += f" | Cards: {cards}"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def get_active_soccer_sports() -> list:
@@ -359,20 +435,66 @@ def update_odds_history(history: dict, snapshot: dict, today: str) -> list:
     return movements
 
 
-def generate_edition(date_str: str, football_data: dict, odds_movements: list) -> dict:
-    """Calls Claude with the editorial system prompt, the collected structured data,
-    and the web search tool (restricted to allowed_domains). Returns the parsed
-    metadata + HTML content — does not publish anything."""
+def _movement_significance(movement: dict) -> float:
+    """Max relative change across outcomes between opening and current odds — the
+    simplest reasonable proxy for "how much did this market actually move"."""
+    opening = movement["opening"]["h2h"]
+    current = movement["current"]["h2h"]
+    deltas = [
+        abs(current[name] - opening[name]) / opening[name]
+        for name in opening
+        if name in current and opening[name]
+    ]
+    return max(deltas) if deltas else 0.0
+
+
+def _select_significant_movements(movements: list, limit: int = 8) -> list:
+    """Only the biggest market moves get sent to Claude — sending all of them (25+
+    on a normal day) was a major contributor to prompt bulk for a section that only
+    ever discusses ONE market per edition anyway."""
+    scored = sorted(movements, key=_movement_significance, reverse=True)
+    return scored[:limit]
+
+
+def _format_odds_movements_as_text(movements: list) -> str:
+    """Compact, human-readable summary — never raw JSON."""
+    if not movements:
+        return "No odds history yet for matches in the near-term window (nothing to compare against)."
+
+    lines = []
+    for m in movements:
+        opening, current = m["opening"]["h2h"], m["current"]["h2h"]
+        move_bits = ", ".join(
+            f"{name} {opening[name]:.2f}->{current[name]:.2f}"
+            for name in opening
+            if name in current
+        )
+        lines.append(
+            f"- {m['home_team']} vs {m['away_team']} (kickoff {m['commence_time']}): "
+            f"{move_bits} [opening {m['opening']['date']} -> current {m['current']['date']}]"
+        )
+    return "\n".join(lines)
+
+
+def generate_edition(date_str: str, football_matches: list, odds_movements: list) -> dict:
+    """Calls Claude with the editorial system prompt, the collected structured data
+    (pre-filtered to priority matches / significant movements and rendered as compact
+    text, never raw JSON), and the web search tool (restricted to allowed_domains).
+    Returns the parsed metadata + HTML content — does not publish anything."""
     user_message = (
         f"Today's date is {date_str}.\n\n"
         "Structured data collected for this date from API-Football and The Odds API — "
-        "use this for all results, fixtures, standings, and market data. Never rely on "
-        "memory for these; use web search only for stories, transfers, quotes, and context "
-        "(including injury/suspension news, since no structured injuries feed is available).\n\n"
-        f"FOOTBALL DATA (fixtures, results, standings):\n{json.dumps(football_data, ensure_ascii=False)}\n\n"
-        "ODDS MARKET MOVEMENT CANDIDATES (matches with an opening line from a previous day; "
-        "empty if none — in that case Market Watch should say plainly that no market moved "
-        f"meaningfully):\n{json.dumps(odds_movements, ensure_ascii=False)}\n\n"
+        "already filtered to the day's priority fixtures and the most significant odds "
+        "movements. Use this for all results, fixtures, standings, and market data. Never "
+        "rely on memory for these; use web search only for stories, transfers, quotes, and "
+        "context (including injury/suspension news, since no structured injuries feed is "
+        "available). If a story you'd want to cover isn't in this list, it's because "
+        "nothing notable was found in the priority competitions today — don't invent "
+        "coverage for leagues not listed here.\n\n"
+        f"PRIORITY FIXTURES:\n{_format_football_data_as_text(football_matches)}\n\n"
+        "ODDS MARKET MOVEMENT CANDIDATES (most significant first; empty if none — in that "
+        "case Market Watch should say plainly that no market moved meaningfully):\n"
+        f"{_format_odds_movements_as_text(odds_movements)}\n\n"
         f"{OUTPUT_FORMAT_INSTRUCTIONS}"
     )
 
@@ -385,14 +507,16 @@ def generate_edition(date_str: str, football_data: dict, odds_movements: list) -
         {
             "type": "web_search_20260209",
             "name": "web_search",
-            "max_uses": 6,
+            "max_uses": 5,
             "allowed_domains": ALLOWED_DOMAINS,
         }
     ]
 
+    # A five-minute daily briefing doesn't need a 16K output budget — capping this
+    # (along with the trimmed input above) is most of the cost reduction.
     with client.messages.stream(
         model="claude-sonnet-5",
-        max_tokens=16000,
+        max_tokens=4000,
         system=SYSTEM_PROMPT,
         tools=tools,
         thinking={"type": "adaptive"},
@@ -544,6 +668,7 @@ def run_daily_briefing(publish_status: str = "draft") -> None:
     metadata: dict | None = None
     content_html: str | None = None
     post_id: int | None = None
+    usage_info: dict = {}
 
     try:
         pending = _load_pending(today)
@@ -552,19 +677,28 @@ def run_daily_briefing(publish_status: str = "draft") -> None:
             metadata, content_html, post_id = pending["metadata"], pending["content_html"], pending.get("post_id")
         else:
             print("Collecting football data...")
-            football = collect_football_data(today)
-            print(f"  {len(football['events'])} events, {len(football['standings'])} leagues with standings")
+            football_matches = collect_football_data(today)
+            print(f"  {len(football_matches)} priority matches selected")
 
             print("Collecting odds data...")
             snapshot = collect_odds_snapshot(within_days=3)
             history = load_odds_history()
             movements = update_odds_history(history, snapshot, today)
             save_odds_history(history)
-            print(f"  {len(snapshot)} odds snapshots, {len(movements)} movement candidates")
+            significant_movements = _select_significant_movements(movements, limit=8)
+            print(
+                f"  {len(snapshot)} odds snapshots, {len(movements)} movement candidates, "
+                f"{len(significant_movements)} most significant selected"
+            )
 
             print("Generating edition...")
-            result = generate_edition(today, football, movements)
+            result = generate_edition(today, football_matches, significant_movements)
             usage = result["usage"]
+            usage_info = {
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "searches_used": result["searches_used"],
+            }
             print(
                 f"  {result['searches_used']} searches used, "
                 f"{usage.input_tokens} input tokens, {usage.output_tokens} output tokens"
@@ -576,7 +710,7 @@ def run_daily_briefing(publish_status: str = "draft") -> None:
         post = _publish_with_retry(metadata, content_html, publish_status, post_id)
         print(f"  {post['link']} (id={post['id']}, status={post['status']})")
 
-        _log_run(post["status"], today, post_id=post["id"], link=post["link"])
+        _log_run(post["status"], today, post_id=post["id"], link=post["link"], **usage_info)
         _clear_pending(today)
         print("Done.")
 
