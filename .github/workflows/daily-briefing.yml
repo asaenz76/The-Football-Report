@@ -1,0 +1,57 @@
+name: Daily Briefing
+
+on:
+  schedule:
+    # 11:00 UTC = 5:00am Costa Rica (UTC-6, no DST)
+    - cron: "0 11 * * *"
+  workflow_dispatch:
+    inputs:
+      publish_status:
+        description: "WordPress post status for this run"
+        required: false
+        default: "draft"
+        type: choice
+        options:
+          - draft
+          - publish
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r requirements.txt
+
+      - name: Run daily briefing
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          WP_URL: ${{ secrets.WP_URL }}
+          WP_USERNAME: ${{ secrets.WP_USERNAME }}
+          WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
+          PUBLISH_STATUS: ${{ inputs.publish_status || 'draft' }}
+        run: python agent.py run
+
+      # These files must persist across runs — odds_history.json tracks opening vs.
+      # current lines (no paid Odds API plan needed), run_log.json is the audit trail,
+      # and data/pending/ preserves a generated-but-not-yet-published edition so a
+      # retry re-publishes instead of re-generating (and never creates a duplicate
+      # post). Commit regardless of whether the run above succeeded — a failed run
+      # still needs its pending content and failure log entry persisted.
+      - name: Commit updated state
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/odds_history.json data/run_log.json data/pending/
+          git diff --staged --quiet || git commit -m "Update run state"
+          git diff --staged --quiet || git push
