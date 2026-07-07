@@ -6,7 +6,7 @@ import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -17,16 +17,13 @@ load_dotenv(".env.local")
 
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 API_FOOTBALL_KEY = os.environ["API_FOOTBALL_KEY"]
-ODDS_API_KEY = os.environ["ODDS_API_KEY"]
 WP_URL = os.environ["WP_URL"]
 WP_USERNAME = os.environ["WP_USERNAME"]
 WP_APP_PASSWORD = os.environ["WP_APP_PASSWORD"]
 
 API_FOOTBALL_BASE = "https://apiv3.apifootball.com"
-ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
 DATA_DIR = Path(__file__).parent / "data"
-ODDS_HISTORY_PATH = DATA_DIR / "odds_history.json"
 RUN_LOG_PATH = DATA_DIR / "run_log.json"
 PENDING_DIR = DATA_DIR / "pending"
 MAX_LOG_ENTRIES = 90
@@ -39,8 +36,8 @@ SYSTEM_PROMPT = (Path(__file__).parent / "system_prompt.md").read_text()
 # NOTE: apnews.com, bbc.com, bbc.co.uk, nytimes.com, reuters.com, theathletic.com, and
 # transfermarkt.com are rejected by the Anthropic web search tool with "not accessible
 # to our user agent" (their robots.txt/user-agent rules block the crawler) — they are
-# excluded here. See the report back to the user about this; it significantly thins out
-# Tier 2 coverage and removes the Tier 3 reference site.
+# excluded here. It significantly thins out Tier 2 coverage and removes the Tier 3
+# reference site, but there's no workaround on our side.
 ALLOWED_DOMAINS = [
     # Tier 1: official governing bodies
     "fifa.com", "uefa.com", "conmebol.com", "concacaf.com", "cafonline.com", "the-afc.com",
@@ -62,9 +59,9 @@ or after, no markdown code fences:
 {"title": "...", "slug": "...", "meta_description": "...", "og_title": "...", "og_description": "...", "publication_date": "YYYY-MM-DD"}
 </meta>
 <content>
-...full HTML body of the edition. Each of the five sections under its own <h2> heading,
-in order: Story of the Day, What Happened Overnight, Matches to Watch, Market Watch,
-Talking Point of the Day...
+...full HTML body of the edition. Each of the four sections under its own <h2> heading,
+in order: Story of the Day, What Happened Overnight, Matches to Watch, Talking Point of
+the Day...
 </content>
 """.strip()
 
@@ -95,18 +92,6 @@ def check_api_football() -> None:
     print(f"  API-Football (apifootball.com): OK — {len(payload)} countries available")
 
 
-def check_odds_api() -> None:
-    resp = requests.get(
-        f"{ODDS_API_BASE}/sports",
-        params={"apiKey": ODDS_API_KEY},
-        timeout=15,
-    )
-    resp.raise_for_status()
-    sports = resp.json()
-    remaining = resp.headers.get("x-requests-remaining")
-    print(f"  The Odds API: OK — {len(sports)} sports available, {remaining} requests remaining")
-
-
 def check_wordpress() -> None:
     resp = requests.get(
         f"{WP_URL}/wp-json/wp/v2/users/me",
@@ -123,8 +108,8 @@ def _apifootball_call(action: str, retries: int = 2, **params) -> list:
     # practice, not just theoretical — so retry with backoff meaningfully improves
     # reliability without masking a genuinely broken key/plan. Kept tight (2 retries,
     # 12s timeout — worst case ~45s per call) because collect_football_data() calls
-    # this once per league for standings; a generous per-call budget multiplied by
-    # ~26 leagues is what caused a 20+ minute stall when apifootball was struggling.
+    # this once per league for standings; a generous per-call budget multiplied across
+    # many leagues is what caused a 20+ minute stall when apifootball was struggling.
     last_exc: Exception | None = None
     for attempt in range(retries + 1):
         try:
@@ -208,7 +193,7 @@ def _is_priority_match(event: dict) -> bool:
     return any(keyword in name for keyword in PRIORITY_LEAGUE_KEYWORDS)
 
 
-def _select_priority_events(events: list, limit: int = 12) -> list:
+def _select_priority_events(events: list, limit: int = 5) -> list:
     """Narrow the day's full fixture list down to what's actually worth putting in
     front of Claude. Sending all ~130 daily events (many from obscure lower
     divisions) was the single biggest driver of generation cost — both directly and
@@ -237,15 +222,15 @@ def _compact_standing(row: dict) -> dict:
 
 
 def collect_football_data(date_str: str) -> list:
-    """Returns a compact list of the day's priority matches, each carrying just its
-    two teams' standings rows (not the full table)."""
+    """Returns a compact list of the day's priority matches (capped at 5), each
+    carrying just its two teams' standings rows (not the full table)."""
     events = get_events(date_str)
-    priority_events = _select_priority_events(events, limit=12)
+    priority_events = _select_priority_events(events, limit=5)
     league_ids = sorted({e["league_id"] for e in priority_events if e.get("league_id")})
 
     standings_raw: dict[str, list] = {}
     if league_ids:
-        with ThreadPoolExecutor(max_workers=6) as pool:
+        with ThreadPoolExecutor(max_workers=5) as pool:
             future_to_league = {pool.submit(get_standings, lid): lid for lid in league_ids}
             for future in as_completed(future_to_league):
                 standings_raw[future_to_league[future]] = future.result()
@@ -293,208 +278,21 @@ def _format_football_data_as_text(matches: list) -> str:
     return "\n".join(lines)
 
 
-def get_active_soccer_sports() -> list:
-    """Free — no odds/markets requested, doesn't count against quota."""
-    resp = requests.get(f"{ODDS_API_BASE}/sports", params={"apiKey": ODDS_API_KEY}, timeout=15)
-    resp.raise_for_status()
-    return [s["key"] for s in resp.json() if s["group"] == "Soccer" and s["active"]]
-
-
-def get_events_for_sport(sport_key: str) -> list:
-    """Free — event list with no odds/markets, doesn't count against quota."""
-    resp = requests.get(f"{ODDS_API_BASE}/sports/{sport_key}/events", params={"apiKey": ODDS_API_KEY}, timeout=15)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def sports_with_upcoming_matches(within_days: int = 3) -> list:
-    """Which soccer sport keys have at least one match kicking off within the next
-    `within_days` days. Uses only the free /events endpoint so we don't spend odds
-    quota on leagues with nothing coming up soon.
-
-    A window (not just "today") matters here: to detect market movement we need to
-    observe the same match's odds on multiple days before kickoff. Restricting to
-    matches happening exactly today would mean every match is seen exactly once —
-    on the day it plays — and opening/current would always be identical."""
-    now = datetime.now(timezone.utc)
-    cutoff = now + timedelta(days=within_days)
-    matching = []
-    for sport_key in get_active_soccer_sports():
-        for event in get_events_for_sport(sport_key):
-            commence = datetime.fromisoformat(event["commence_time"].replace("Z", "+00:00"))
-            if now <= commence <= cutoff:
-                matching.append(sport_key)
-                break
-    return matching
-
-
-def get_odds_for_sport(sport_key: str) -> list:
-    resp = requests.get(
-        f"{ODDS_API_BASE}/sports/{sport_key}/odds",
-        params={"apiKey": ODDS_API_KEY, "regions": "uk,us,eu", "markets": "h2h", "oddsFormat": "decimal"},
-        timeout=20,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def _consensus_h2h(event: dict) -> dict | None:
-    """Average decimal odds per outcome across all bookmakers offering h2h — a simple market consensus."""
-    totals: dict[str, float] = {}
-    counts: dict[str, int] = {}
-    for bookmaker in event.get("bookmakers", []):
-        for market in bookmaker.get("markets", []):
-            if market["key"] != "h2h":
-                continue
-            for outcome in market["outcomes"]:
-                totals[outcome["name"]] = totals.get(outcome["name"], 0.0) + outcome["price"]
-                counts[outcome["name"]] = counts.get(outcome["name"], 0) + 1
-    if not totals:
-        return None
-    return {name: round(totals[name] / counts[name], 3) for name in totals}
-
-
-def collect_odds_snapshot(within_days: int = 3) -> dict:
-    """Consensus h2h odds for soccer matches kicking off within `within_days` days,
-    keyed by match id. Only spends odds-quota requests on leagues with something
-    coming up soon."""
-    snapshot = {}
-    for sport_key in sports_with_upcoming_matches(within_days):
-        try:
-            events = get_odds_for_sport(sport_key)
-        except requests.exceptions.HTTPError:
-            # Some sport keys are outright/futures markets (e.g. "_winner") with no
-            # per-match h2h market — skip rather than fail the whole run.
-            continue
-        for event in events:
-            consensus = _consensus_h2h(event)
-            if consensus is None:
-                continue
-            snapshot[event["id"]] = {
-                "sport_key": sport_key,
-                "sport_title": event["sport_title"],
-                "home_team": event["home_team"],
-                "away_team": event["away_team"],
-                "commence_time": event["commence_time"],
-                "h2h": consensus,
-            }
-    return snapshot
-
-
-def load_odds_history() -> dict:
-    if ODDS_HISTORY_PATH.exists():
-        return json.loads(ODDS_HISTORY_PATH.read_text())
-    return {}
-
-
-def save_odds_history(history: dict) -> None:
-    DATA_DIR.mkdir(exist_ok=True)
-    ODDS_HISTORY_PATH.write_text(json.dumps(history, indent=2, sort_keys=True))
-
-
-def update_odds_history(history: dict, snapshot: dict, today: str) -> list:
-    """Merge today's snapshot into history in place. Returns matches with an opening
-    line from a previous day, i.e. candidates for describing market movement."""
-    movements = []
-
-    for match_id, today_data in snapshot.items():
-        entry = history.get(match_id)
-        if entry is None:
-            history[match_id] = {
-                "sport_key": today_data["sport_key"],
-                "sport_title": today_data["sport_title"],
-                "home_team": today_data["home_team"],
-                "away_team": today_data["away_team"],
-                "commence_time": today_data["commence_time"],
-                "opening": {"date": today, "h2h": today_data["h2h"]},
-                "latest": {"date": today, "h2h": today_data["h2h"]},
-            }
-            continue
-
-        if entry["opening"]["date"] != today:
-            movements.append({
-                "home_team": entry["home_team"],
-                "away_team": entry["away_team"],
-                "commence_time": entry["commence_time"],
-                "opening": entry["opening"],
-                "current": {"date": today, "h2h": today_data["h2h"]},
-            })
-        entry["latest"] = {"date": today, "h2h": today_data["h2h"]}
-
-    # Prune matches that have already kicked off — keeps the file bounded.
-    now = datetime.now(timezone.utc)
-    for match_id in list(history.keys()):
-        commence = history[match_id].get("commence_time")
-        try:
-            kickoff = datetime.fromisoformat(commence.replace("Z", "+00:00"))
-        except (TypeError, ValueError):
-            continue
-        if kickoff < now:
-            del history[match_id]
-
-    return movements
-
-
-def _movement_significance(movement: dict) -> float:
-    """Max relative change across outcomes between opening and current odds — the
-    simplest reasonable proxy for "how much did this market actually move"."""
-    opening = movement["opening"]["h2h"]
-    current = movement["current"]["h2h"]
-    deltas = [
-        abs(current[name] - opening[name]) / opening[name]
-        for name in opening
-        if name in current and opening[name]
-    ]
-    return max(deltas) if deltas else 0.0
-
-
-def _select_significant_movements(movements: list, limit: int = 8) -> list:
-    """Only the biggest market moves get sent to Claude — sending all of them (25+
-    on a normal day) was a major contributor to prompt bulk for a section that only
-    ever discusses ONE market per edition anyway."""
-    scored = sorted(movements, key=_movement_significance, reverse=True)
-    return scored[:limit]
-
-
-def _format_odds_movements_as_text(movements: list) -> str:
-    """Compact, human-readable summary — never raw JSON."""
-    if not movements:
-        return "No odds history yet for matches in the near-term window (nothing to compare against)."
-
-    lines = []
-    for m in movements:
-        opening, current = m["opening"]["h2h"], m["current"]["h2h"]
-        move_bits = ", ".join(
-            f"{name} {opening[name]:.2f}->{current[name]:.2f}"
-            for name in opening
-            if name in current
-        )
-        lines.append(
-            f"- {m['home_team']} vs {m['away_team']} (kickoff {m['commence_time']}): "
-            f"{move_bits} [opening {m['opening']['date']} -> current {m['current']['date']}]"
-        )
-    return "\n".join(lines)
-
-
-def generate_edition(date_str: str, football_matches: list, odds_movements: list) -> dict:
+def generate_edition(date_str: str, football_matches: list) -> dict:
     """Calls Claude with the editorial system prompt, the collected structured data
-    (pre-filtered to priority matches / significant movements and rendered as compact
-    text, never raw JSON), and the web search tool (restricted to allowed_domains).
-    Returns the parsed metadata + HTML content — does not publish anything."""
+    (pre-filtered to priority matches and rendered as compact text, never raw JSON),
+    and the web search tool (restricted to allowed_domains). Returns the parsed
+    metadata + HTML content — does not publish anything."""
     user_message = (
         f"Today's date is {date_str}.\n\n"
-        "Structured data collected for this date from API-Football and The Odds API — "
-        "already filtered to the day's priority fixtures and the most significant odds "
-        "movements. Use this for all results, fixtures, standings, and market data. Never "
-        "rely on memory for these; use web search only for stories, transfers, quotes, and "
-        "context (including injury/suspension news, since no structured injuries feed is "
-        "available). If a story you'd want to cover isn't in this list, it's because "
-        "nothing notable was found in the priority competitions today — don't invent "
-        "coverage for leagues not listed here.\n\n"
+        "Structured data collected for this date from API-Football — already filtered "
+        "to the day's priority fixtures. Use this for all results, fixtures, and "
+        "standings. Never rely on memory for these; use web search only for stories, "
+        "transfers, quotes, and context (including injury/suspension news, since no "
+        "structured injuries feed is available). If a story you'd want to cover isn't "
+        "in this list, it's because nothing notable was found in the priority "
+        "competitions today — don't invent coverage for leagues not listed here.\n\n"
         f"PRIORITY FIXTURES:\n{_format_football_data_as_text(football_matches)}\n\n"
-        "ODDS MARKET MOVEMENT CANDIDATES (most significant first; empty if none — in that "
-        "case Market Watch should say plainly that no market moved meaningfully):\n"
-        f"{_format_odds_movements_as_text(odds_movements)}\n\n"
         f"{OUTPUT_FORMAT_INSTRUCTIONS}"
     )
 
@@ -507,7 +305,7 @@ def generate_edition(date_str: str, football_matches: list, odds_movements: list
         {
             "type": "web_search_20260209",
             "name": "web_search",
-            "max_uses": 5,
+            "max_uses": 4,
             "allowed_domains": ALLOWED_DOMAINS,
         }
     ]
@@ -534,7 +332,8 @@ def generate_edition(date_str: str, football_matches: list, odds_movements: list
     content_match = re.search(r"<content>(.*?)</content>", full_text, re.DOTALL)
     if not meta_match or not content_match:
         raise RuntimeError(
-            "Claude's response did not match the expected <meta>/<content> format:\n" + full_text
+            "Claude's response did not match the expected <meta>/<content> format "
+            f"(stop_reason={message.stop_reason}):\n" + full_text
         )
 
     metadata = json.loads(meta_match.group(1).strip())
@@ -680,19 +479,8 @@ def run_daily_briefing(publish_status: str = "draft") -> None:
             football_matches = collect_football_data(today)
             print(f"  {len(football_matches)} priority matches selected")
 
-            print("Collecting odds data...")
-            snapshot = collect_odds_snapshot(within_days=3)
-            history = load_odds_history()
-            movements = update_odds_history(history, snapshot, today)
-            save_odds_history(history)
-            significant_movements = _select_significant_movements(movements, limit=8)
-            print(
-                f"  {len(snapshot)} odds snapshots, {len(movements)} movement candidates, "
-                f"{len(significant_movements)} most significant selected"
-            )
-
             print("Generating edition...")
-            result = generate_edition(today, football_matches, significant_movements)
+            result = generate_edition(today, football_matches)
             usage = result["usage"]
             usage_info = {
                 "input_tokens": usage.input_tokens,
@@ -735,7 +523,6 @@ def main() -> None:
     checks = [
         ("Anthropic", check_anthropic),
         ("API-Football", check_api_football),
-        ("The Odds API", check_odds_api),
         ("WordPress", check_wordpress),
     ]
 

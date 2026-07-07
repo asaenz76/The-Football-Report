@@ -19,16 +19,15 @@ cp .env.local.example .env.local   # fill in real values, never commit this file
 ## Running locally
 
 ```bash
-python agent.py
+python agent.py           # connection check against Anthropic, API-Football, WordPress
+python agent.py run       # the actual daily job: collect data, generate, publish
 ```
 
-This currently runs a connection check against all four external services (Anthropic,
-API-Football, The Odds API, WordPress). Later steps add data collection, generation, and
-publishing.
+`PUBLISH_STATUS=draft` (the default) creates a WordPress draft instead of publishing live —
+set `PUBLISH_STATUS=publish` to publish for real.
 
 ## Secrets
 
 In production these are set as GitHub Actions repository secrets (`ANTHROPIC_API_KEY`,
-`API_FOOTBALL_KEY`, `ODDS_API_KEY`, `WP_URL`, `WP_USERNAME`, `WP_APP_PASSWORD`) — never
-committed to the repo. `WP_APP_PASSWORD` is a WordPress Application Password, not the account
-login password.
+`API_FOOTBALL_KEY`, `WP_URL`, `WP_USERNAME`, `WP_APP_PASSWORD`) — never committed to the
+repo. `WP_APP_PASSWORD` is a WordPress Application Password, not the account login password.
