@@ -39,6 +39,7 @@ jobs:
           WP_USERNAME: ${{ secrets.WP_USERNAME }}
           WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
           PUBLISH_STATUS: ${{ inputs.publish_status || 'draft' }}
+          PYTHONUNBUFFERED: "1"
         run: python agent.py run
 
       # These files must persist across runs — odds_history.json tracks opening vs.

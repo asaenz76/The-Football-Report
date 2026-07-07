@@ -364,12 +364,14 @@ def generate_edition(date_str: str, football_data: dict, odds_movements: list) -
 
     # A generous but bounded timeout — plain httpx/requests read timeouts are per-chunk,
     # not wall-clock, so a stalled streaming connection can otherwise hang indefinitely.
-    client = Anthropic(api_key=ANTHROPIC_API_KEY, timeout=480.0)
+    # max_retries=0: the SDK's own retries would otherwise multiply this timeout up to
+    # (max_retries + 1)x, turning an already-generous bound into a much longer one.
+    client = Anthropic(api_key=ANTHROPIC_API_KEY, timeout=300.0, max_retries=0)
     tools = [
         {
             "type": "web_search_20260209",
             "name": "web_search",
-            "max_uses": 10,
+            "max_uses": 6,
             "allowed_domains": ALLOWED_DOMAINS,
         }
     ]
@@ -380,7 +382,7 @@ def generate_edition(date_str: str, football_data: dict, odds_movements: list) -
         system=SYSTEM_PROMPT,
         tools=tools,
         thinking={"type": "adaptive"},
-        output_config={"effort": "high"},
+        output_config={"effort": "medium"},
         messages=[{"role": "user", "content": user_message}],
     ) as stream:
         message = stream.get_final_message()
@@ -564,7 +566,10 @@ def run_daily_briefing(publish_status: str = "draft") -> None:
         _clear_pending(today)
         print("Done.")
 
-    except Exception as exc:
+    except (Exception, KeyboardInterrupt) as exc:
+        # KeyboardInterrupt (not a subclass of Exception) is what a GitHub Actions
+        # cancellation surfaces as — without catching it explicitly here, a canceled
+        # run would skip this entire safety net silently.
         print(f"FAILED: {exc}")
         if metadata is not None and content_html is not None:
             # Preserve content (and the post_id, if publish had already created one on
