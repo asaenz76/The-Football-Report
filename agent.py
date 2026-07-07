@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -117,17 +118,20 @@ def check_wordpress() -> None:
     print(f"  WordPress: OK — authenticated as \"{user['name']}\" (user id {user['id']})")
 
 
-def _apifootball_call(action: str, retries: int = 4, **params) -> list:
+def _apifootball_call(action: str, retries: int = 2, **params) -> list:
     # apifootball.com returns frequent 500/502s under normal operation — observed in
     # practice, not just theoretical — so retry with backoff meaningfully improves
-    # reliability without masking a genuinely broken key/plan.
+    # reliability without masking a genuinely broken key/plan. Kept tight (2 retries,
+    # 12s timeout — worst case ~45s per call) because collect_football_data() calls
+    # this once per league for standings; a generous per-call budget multiplied by
+    # ~26 leagues is what caused a 20+ minute stall when apifootball was struggling.
     last_exc: Exception | None = None
     for attempt in range(retries + 1):
         try:
             resp = requests.get(
                 f"{API_FOOTBALL_BASE}/",
                 params={"action": action, "APIkey": API_FOOTBALL_KEY, **params},
-                timeout=20,
+                timeout=12,
             )
             resp.raise_for_status()
             payload = resp.json()
@@ -196,7 +200,17 @@ def _trim_standings_row(row: dict) -> dict:
 def collect_football_data(date_str: str) -> dict:
     events = get_events(date_str)
     league_ids = sorted({e["league_id"] for e in events if e.get("league_id")})
-    standings = {lid: get_standings(lid) for lid in league_ids}
+
+    # Fetch standings in parallel — sequentially, ~26 leagues each with their own
+    # retry budget against a flaky endpoint was what caused a 20+ minute stall.
+    # Bounded worst case now: (leagues / max_workers) * ~45s per call, not the sum.
+    standings: dict[str, list] = {}
+    if league_ids:
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            future_to_league = {pool.submit(get_standings, lid): lid for lid in league_ids}
+            for future in as_completed(future_to_league):
+                standings[future_to_league[future]] = future.result()
+
     return {
         "events": [_trim_event(e) for e in events],
         "standings": {lid: [_trim_standings_row(r) for r in rows] for lid, rows in standings.items()},
